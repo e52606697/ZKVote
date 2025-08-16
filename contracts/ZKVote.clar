@@ -14,11 +14,20 @@
 (define-constant ERR_STAKE_LOCKED (err u112))
 (define-constant ERR_INSUFFICIENT_REPUTATION (err u113))
 (define-constant ERR_INVALID_AMOUNT (err u114))
+(define-constant ERR_DELEGATION_EXISTS (err u115))
+(define-constant ERR_DELEGATION_NOT_FOUND (err u116))
+(define-constant ERR_SELF_DELEGATION (err u117))
+(define-constant ERR_CIRCULAR_DELEGATION (err u118))
+(define-constant ERR_DELEGATION_EXPIRED (err u119))
+(define-constant ERR_DELEGATE_NOT_REGISTERED (err u120))
+(define-constant ERR_INVALID_DELEGATION_DEPTH (err u121))
 
 (define-data-var poll-counter uint u0)
 (define-data-var minimum-stake uint u1000000)
 (define-data-var base-reputation uint u100)
 (define-data-var stake-lock-period uint u144)
+(define-data-var max-delegation-depth uint u5)
+(define-data-var delegation-period uint u1008)
 
 (define-map polls
   { poll-id: uint }
@@ -86,6 +95,48 @@
     reputation-change: int,
     final-reputation: uint,
     vote-outcome: bool
+  }
+)
+
+(define-map delegates
+  { delegate: principal }
+  {
+    is-registered: bool,
+    registration-block: uint,
+    total-delegated-weight: uint,
+    delegation-count: uint,
+    max-delegations: uint,
+    reputation-multiplier: uint
+  }
+)
+
+(define-map delegations
+  { delegator: principal }
+  {
+    delegate: principal,
+    delegation-block: uint,
+    expiry-block: uint,
+    delegated-weight: uint,
+    is-active: bool
+  }
+)
+
+(define-map delegation-chains
+  { delegator: principal, delegate: principal }
+  {
+    chain-depth: uint,
+    final-delegate: principal,
+    total-weight: uint
+  }
+)
+
+(define-map poll-delegations
+  { poll-id: uint, delegate: principal }
+  {
+    total-delegated-votes: uint,
+    delegator-count: uint,
+    voting-weight: uint,
+    has-voted: bool
   }
 )
 
@@ -540,3 +591,308 @@
     false
   )
 )
+
+(define-public (register-as-delegate (max-delegations uint))
+  (let
+    (
+      (existing-delegate (map-get? delegates { delegate: tx-sender }))
+    )
+    (asserts! (is-none existing-delegate) ERR_DELEGATION_EXISTS)
+    (asserts! (> max-delegations u0) ERR_INVALID_AMOUNT)
+    
+    (map-set delegates
+      { delegate: tx-sender }
+      {
+        is-registered: true,
+        registration-block: stacks-block-height,
+        total-delegated-weight: u0,
+        delegation-count: u0,
+        max-delegations: max-delegations,
+        reputation-multiplier: u100
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (delegate-voting-power (delegate principal) (duration uint))
+  (let
+    (
+      (delegator-stake (unwrap! (map-get? voter-stakes { voter: tx-sender }) ERR_NO_STAKE_FOUND))
+      (delegate-data (unwrap! (map-get? delegates { delegate: delegate }) ERR_DELEGATE_NOT_REGISTERED))
+      (existing-delegation (map-get? delegations { delegator: tx-sender }))
+      (expiry-block (+ stacks-block-height duration))
+      (delegated-weight (get staked-amount delegator-stake))
+    )
+    (asserts! (not (is-eq tx-sender delegate)) ERR_SELF_DELEGATION)
+    (asserts! (is-none existing-delegation) ERR_DELEGATION_EXISTS)
+    (asserts! (get is-registered delegate-data) ERR_DELEGATE_NOT_REGISTERED)
+    (asserts! (< (get delegation-count delegate-data) (get max-delegations delegate-data)) ERR_INVALID_AMOUNT)
+    (asserts! (get is-active delegator-stake) ERR_STAKE_LOCKED)
+    (asserts! (<= duration (var-get delegation-period)) ERR_INVALID_AMOUNT)
+    
+    (asserts! (not (is-eq tx-sender delegate)) ERR_SELF_DELEGATION)
+    
+    (map-set delegations
+      { delegator: tx-sender }
+      {
+        delegate: delegate,
+        delegation-block: stacks-block-height,
+        expiry-block: expiry-block,
+        delegated-weight: delegated-weight,
+        is-active: true
+      }
+    )
+    
+    (map-set delegates
+      { delegate: delegate }
+      (merge delegate-data {
+        total-delegated-weight: (+ (get total-delegated-weight delegate-data) delegated-weight),
+        delegation-count: (+ (get delegation-count delegate-data) u1)
+      })
+    )
+    
+    (ok expiry-block)
+  )
+)
+
+(define-public (revoke-delegation)
+  (let
+    (
+      (delegation-data (unwrap! (map-get? delegations { delegator: tx-sender }) ERR_DELEGATION_NOT_FOUND))
+      (delegate (get delegate delegation-data))
+      (delegate-data (unwrap! (map-get? delegates { delegate: delegate }) ERR_DELEGATE_NOT_REGISTERED))
+      (delegated-weight (get delegated-weight delegation-data))
+    )
+    (asserts! (get is-active delegation-data) ERR_DELEGATION_EXPIRED)
+    
+    (map-delete delegations { delegator: tx-sender })
+    
+    (map-set delegates
+      { delegate: delegate }
+      (merge delegate-data {
+        total-delegated-weight: (- (get total-delegated-weight delegate-data) delegated-weight),
+        delegation-count: (- (get delegation-count delegate-data) u1)
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (vote-as-delegate (poll-id uint) (nullifier-hash (buff 32)) (vote-option uint) (proof-hash (buff 32)))
+  (let
+    (
+      (poll-data (unwrap! (map-get? polls { poll-id: poll-id }) ERR_POLL_NOT_FOUND))
+      (delegate-data (unwrap! (map-get? delegates { delegate: tx-sender }) ERR_DELEGATE_NOT_REGISTERED))
+      (existing-nullifier (map-get? nullifiers { nullifier-hash: nullifier-hash }))
+      (option-count (len (get options poll-data)))
+      (total-voting-weight (calculate-delegate-voting-weight tx-sender poll-id))
+    )
+    (asserts! (get is-active poll-data) ERR_POLL_ENDED)
+    (asserts! (< stacks-block-height (get end-block poll-data)) ERR_POLL_ENDED)
+    (asserts! (is-none existing-nullifier) ERR_NULLIFIER_USED)
+    (asserts! (< vote-option option-count) ERR_INVALID_OPTION)
+    (asserts! (get is-registered delegate-data) ERR_DELEGATE_NOT_REGISTERED)
+    (asserts! (> total-voting-weight u0) ERR_INSUFFICIENT_STAKE)
+    
+    (map-set nullifiers
+      { nullifier-hash: nullifier-hash }
+      { poll-id: poll-id, used: true }
+    )
+    
+    (map-set zk-proofs
+      { poll-id: poll-id, proof-hash: proof-hash }
+      { nullifier: nullifier-hash, vote-option: vote-option, is-valid: true }
+    )
+    
+    (let
+      (
+        (current-votes (default-to u0 (get vote-count (map-get? poll-results { poll-id: poll-id, option-index: vote-option }))))
+        (total-votes (get total-votes poll-data))
+      )
+      (map-set poll-results
+        { poll-id: poll-id, option-index: vote-option }
+        { vote-count: (+ current-votes total-voting-weight) }
+      )
+      
+      (map-set polls
+        { poll-id: poll-id }
+        (merge poll-data { total-votes: (+ total-votes total-voting-weight) })
+      )
+      
+      (map-set poll-delegations
+        { poll-id: poll-id, delegate: tx-sender }
+        {
+          total-delegated-votes: total-voting-weight,
+          delegator-count: (get delegation-count delegate-data),
+          voting-weight: total-voting-weight,
+          has-voted: true
+        }
+      )
+    )
+    
+    (ok total-voting-weight)
+  )
+)
+
+(define-public (extend-delegation (additional-duration uint))
+  (let
+    (
+      (delegation-data (unwrap! (map-get? delegations { delegator: tx-sender }) ERR_DELEGATION_NOT_FOUND))
+      (current-expiry (get expiry-block delegation-data))
+      (new-expiry (+ current-expiry additional-duration))
+      (max-period (var-get delegation-period))
+    )
+    (asserts! (get is-active delegation-data) ERR_DELEGATION_EXPIRED)
+    (asserts! (<= (- new-expiry stacks-block-height) max-period) ERR_INVALID_AMOUNT)
+    
+    (map-set delegations
+      { delegator: tx-sender }
+      (merge delegation-data { expiry-block: new-expiry })
+    )
+    
+    (ok new-expiry)
+  )
+)
+
+(define-public (update-delegate-settings (max-delegations uint) (reputation-multiplier uint))
+  (let
+    (
+      (delegate-data (unwrap! (map-get? delegates { delegate: tx-sender }) ERR_DELEGATE_NOT_REGISTERED))
+    )
+    (asserts! (get is-registered delegate-data) ERR_DELEGATE_NOT_REGISTERED)
+    (asserts! (>= max-delegations (get delegation-count delegate-data)) ERR_INVALID_AMOUNT)
+    (asserts! (<= reputation-multiplier u200) ERR_INVALID_AMOUNT)
+    
+    (map-set delegates
+      { delegate: tx-sender }
+      (merge delegate-data {
+        max-delegations: max-delegations,
+        reputation-multiplier: reputation-multiplier
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (batch-delegate-votes (poll-ids (list 10 uint)) (vote-options (list 10 uint)) (nullifier-hashes (list 10 (buff 32))) (proof-hashes (list 10 (buff 32))))
+  (let
+    (
+      (delegate-data (unwrap! (map-get? delegates { delegate: tx-sender }) ERR_DELEGATE_NOT_REGISTERED))
+    )
+    (asserts! (get is-registered delegate-data) ERR_DELEGATE_NOT_REGISTERED)
+    (asserts! (is-eq (len poll-ids) (len vote-options)) ERR_INVALID_AMOUNT)
+    (asserts! (is-eq (len poll-ids) (len nullifier-hashes)) ERR_INVALID_AMOUNT)
+    (asserts! (is-eq (len poll-ids) (len proof-hashes)) ERR_INVALID_AMOUNT)
+    
+    (fold process-batch-vote 
+      (zip-four poll-ids vote-options nullifier-hashes proof-hashes)
+      { success: true, votes-cast: u0 }
+    )
+    
+    (ok true)
+  )
+)
+
+
+
+(define-private (calculate-delegate-voting-weight (delegate principal) (poll-id uint))
+  (let
+    (
+      (delegate-data (unwrap-panic (map-get? delegates { delegate: delegate })))
+      (delegate-stake (map-get? voter-stakes { voter: delegate }))
+      (base-weight (match delegate-stake
+        stake-info (get staked-amount stake-info)
+        u0))
+      (delegated-weight (get total-delegated-weight delegate-data))
+      (reputation-mult (get reputation-multiplier delegate-data))
+    )
+    (+ base-weight (/ (* delegated-weight reputation-mult) u100))
+  )
+)
+
+(define-private (process-batch-vote (vote-data { poll-id: uint, vote-option: uint, nullifier: (buff 32), proof: (buff 32) }) (context { success: bool, votes-cast: uint }))
+  (let
+    (
+      (poll-id (get poll-id vote-data))
+      (vote-option (get vote-option vote-data))
+      (nullifier-hash (get nullifier vote-data))
+      (proof-hash (get proof vote-data))
+    )
+    (match (vote-as-delegate poll-id nullifier-hash vote-option proof-hash)
+      success-result
+      { success: true, votes-cast: (+ (get votes-cast context) u1) }
+      error-result
+      context
+    )
+  )
+)
+
+(define-private (zip-four (list-a (list 10 uint)) (list-b (list 10 uint)) (list-c (list 10 (buff 32))) (list-d (list 10 (buff 32))))
+  (map create-vote-entry list-a list-b list-c list-d)
+)
+
+(define-private (create-vote-entry (poll-id uint) (vote-option uint) (nullifier (buff 32)) (proof (buff 32)))
+  { poll-id: poll-id, vote-option: vote-option, nullifier: nullifier, proof: proof }
+)
+
+(define-read-only (get-delegate-info (delegate principal))
+  (map-get? delegates { delegate: delegate })
+)
+
+(define-read-only (get-delegation-info (delegator principal))
+  (map-get? delegations { delegator: delegator })
+)
+
+(define-read-only (get-delegation-chain (delegator principal) (delegate principal))
+  (map-get? delegation-chains { delegator: delegator, delegate: delegate })
+)
+
+(define-read-only (get-poll-delegation-info (poll-id uint) (delegate principal))
+  (map-get? poll-delegations { poll-id: poll-id, delegate: delegate })
+)
+
+(define-read-only (is-delegation-active (delegator principal))
+  (match (map-get? delegations { delegator: delegator })
+    delegation-data
+    (and 
+      (get is-active delegation-data)
+      (< stacks-block-height (get expiry-block delegation-data))
+    )
+    false
+  )
+)
+
+(define-read-only (get-effective-voting-power (voter principal) (poll-id uint))
+  (let
+    (
+      (delegation-data (map-get? delegations { delegator: voter }))
+      (voter-stake (map-get? voter-stakes { voter: voter }))
+    )
+    (match delegation-data
+      delegation-info
+      (if (and (get is-active delegation-info) (< stacks-block-height (get expiry-block delegation-info)))
+        u0
+        (match voter-stake
+          stake-info (get staked-amount stake-info)
+          u0))
+      (match voter-stake
+        stake-info (get staked-amount stake-info)
+        u0)
+    )
+  )
+)
+
+(define-read-only (get-max-delegation-depth)
+  (var-get max-delegation-depth)
+)
+
+(define-read-only (get-delegation-period)
+  (var-get delegation-period)
+)
+
+
+
